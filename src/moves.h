@@ -37,15 +37,17 @@ void add_face_rotation(std::array<int, 6*N*N>& p, Face f) {
 //
 //   U CW: F(lo,i)→L(lo,i)→B(lo,i)→R(lo,i)
 //   D CW: F(hi,i)→R(hi,i)→B(hi,i)→L(hi,i)
-//   F CW: U(hi,i)→R(i,lo)→D(lo,hi-i)→L(hi-i,hi)
-//   B CW: U(lo,i)→L(hi-i,lo)→D(hi,hi-i)→R(i,hi)
-//   L CW: U(i,lo)→F(i,lo)→D(i,lo)→B(hi-i,hi)
-//   R CW: U(i,hi)→B(hi-i,lo)→D(i,hi)→F(i,hi)
+//   F CW: U(hi,i)→R(i,lo)→D(lo,N-1-i)→L(N-1-i,hi)
+//   B CW: U(lo,i)→L(N-1-i,lo)→D(hi,N-1-i)→R(i,hi)
+//   L CW: U(i,lo)→F(i,lo)→D(i,lo)→B(N-1-i,hi)
+//   R CW: U(i,hi)→B(N-1-i,lo)→D(i,hi)→F(i,hi)
 template<int N>
 std::array<std::array<int,N>, 4> edge_strips(Face f, int layer) {
     std::array<std::array<int,N>, 4> strips;
     auto idx = [](int face, int r, int c){ return Cube<N>::idx(face, r, c); };
     int lo = layer, hi = N-1-layer;
+    // Reversed strips run N-1-i (not hi-i: that only coincides for layer 0).
+    int rev = N-1;
 
     if (f == Face::U) {
         // CW from above: pieces FL→BL→BR→FR, stickers F→L→B→R
@@ -62,21 +64,21 @@ std::array<std::array<int,N>, 4> edge_strips(Face f, int layer) {
     } else if (f == Face::F) {
         for (int i = 0; i < N; ++i) strips[0][i] = idx(U, hi, i);
         for (int i = 0; i < N; ++i) strips[1][i] = idx(R, i, lo);
-        for (int i = 0; i < N; ++i) strips[2][i] = idx(D, lo, hi-i);
-        for (int i = 0; i < N; ++i) strips[3][i] = idx(L, hi-i, hi);
+        for (int i = 0; i < N; ++i) strips[2][i] = idx(D, lo, rev-i);
+        for (int i = 0; i < N; ++i) strips[3][i] = idx(L, rev-i, hi);
     } else if (f == Face::B) {
         for (int i = 0; i < N; ++i) strips[0][i] = idx(U, lo, i);
-        for (int i = 0; i < N; ++i) strips[1][i] = idx(L, hi-i, lo);
-        for (int i = 0; i < N; ++i) strips[2][i] = idx(D, hi, hi-i);
+        for (int i = 0; i < N; ++i) strips[1][i] = idx(L, rev-i, lo);
+        for (int i = 0; i < N; ++i) strips[2][i] = idx(D, hi, rev-i);
         for (int i = 0; i < N; ++i) strips[3][i] = idx(R, i, hi);
     } else if (f == Face::L) {
         for (int i = 0; i < N; ++i) strips[0][i] = idx(U, i, lo);
         for (int i = 0; i < N; ++i) strips[1][i] = idx(F, i, lo);
         for (int i = 0; i < N; ++i) strips[2][i] = idx(D, i, lo);
-        for (int i = 0; i < N; ++i) strips[3][i] = idx(B, hi-i, hi);
+        for (int i = 0; i < N; ++i) strips[3][i] = idx(B, rev-i, hi);
     } else { // R
         for (int i = 0; i < N; ++i) strips[0][i] = idx(U, i, hi);
-        for (int i = 0; i < N; ++i) strips[1][i] = idx(B, hi-i, lo);
+        for (int i = 0; i < N; ++i) strips[1][i] = idx(B, rev-i, lo);
         for (int i = 0; i < N; ++i) strips[2][i] = idx(D, i, hi);
         for (int i = 0; i < N; ++i) strips[3][i] = idx(F, i, hi);
     }
