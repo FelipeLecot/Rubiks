@@ -13,3 +13,8 @@ add_executable(ll_optimal src/tools/ll_optimal.cpp)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(ll_optimal PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+add_executable(method_stats src/tools/method_stats.cpp)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(method_stats PRIVATE OpenMP::OpenMP_CXX)
+endif()
