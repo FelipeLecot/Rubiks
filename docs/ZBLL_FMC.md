@@ -59,9 +59,9 @@ Files:
   a cancellation has to come from AUF alone, or from a solution one move
   longer.
 - **44% of cases (216): every optimal solution starts and ends on the same
-  face**, e.g. `F … F'`, `R … R'`, the setup–commutator–undo shape. That's
-  good for FMC: a skeleton ending in that face can cancel on both sides of an
-  inverse-scramble (NISS) trick.
+  face**, e.g. `F … F'`, `R … R'`, the setup–commutator–undo shape. For
+  these the faces at both ends are fixed, which narrows where a
+  cancellation can happen.
 - Only 39 cases have an optimal solution without any half turn.
 
 ## How the numbers are proven
