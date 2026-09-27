@@ -14,8 +14,15 @@
 //   QTM  (quarter turn metric): quarter turn = 1, half turn = 2
 // Pre- and post-AUF (U turns before / after) are free, as is customary.
 //
-// Usage: ll_optimal [pll|oll|all] [--qtm] [--cache DIR]
-// The pattern databases (~230 MB) are built on first run and cached on disk.
+// Usage: ll_optimal [pll|oll|all] [--qtm] [--cache DIR] [--only CASE]
+//        ll_optimal zbll [--near 7] [--from I] [--to J] [--data FILE]
+//   zbll: every last-layer case with oriented edges (493), all optimal
+//         solutions written to FILE (default zbll_solutions.txt), for FMC.
+//   --near D: exact table of all positions within D moves (default 6;
+//             7 needs ~4 GB) that replaces the last D levels of each search.
+//   --syms K: also consult the edge databases from K rotated viewpoints
+//             (admissible but slower on this hardware; default 0).
+// The pattern databases (~1.2 GB) are built on first run and cached on disk.
 
 #include "cube.h"
 #include "moves.h"
@@ -224,6 +231,41 @@ static void init_moves() {
             MOVES[f * 3 + k] = to_cubie(Cube3::solved().apply(layer_turn(Face(f), 0, k + 1)));
 }
 
+static CubieCube inverse(const CubieCube& c) {
+    CubieCube r;
+    for (int i = 0; i < 8; ++i) { r.cp[c.cp[i]] = i; r.co[c.cp[i]] = (3 - c.co[i]) % 3; }
+    for (int i = 0; i < 12; ++i) { r.ep[c.ep[i]] = i; r.eo[c.ep[i]] = c.eo[i]; }
+    return r;
+}
+
+// Cubie cube → sticker cube (centers at home); inverse of to_cubie.
+static Cube3 from_cubie(const CubieCube& c) {
+    Cube3 r = Cube3::solved();
+    for (int i = 0; i < 8; ++i)
+        for (int k = 0; k < 3; ++k) r.s[CF[i][(c.co[i] + k) % 3]] = CF[c.cp[i]][k] / 9;
+    for (int i = 0; i < 12; ++i)
+        for (int k = 0; k < 2; ++k) r.s[EF[i][(c.eo[i] + k) % 2]] = EF[c.ep[i]][k] / 9;
+    return r;
+}
+
+// Whole-cube rotations as cubie arrangements. Conjugating a state by one maps
+// face turns to face turns, so the distance to solved is unchanged — which
+// lets one pattern database be consulted "from several viewpoints".
+static std::vector<CubieCube> SYMS, SYMS_INV;
+static void init_syms() {
+    for (auto& rot : rotations()) {
+        CubieCube S = to_cubie(Cube3::solved().apply(rot)), Si = inverse(S);
+        for (int m = 0; m < 18; ++m) {
+            CubieCube c = Si * MOVES[m] * S;
+            bool ok = false;
+            for (int n = 0; n < 18; ++n) ok |= c == MOVES[n];
+            if (!ok) throw std::runtime_error("rotation does not conjugate moves to moves");
+        }
+        SYMS.push_back(S);
+        SYMS_INV.push_back(Si);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Pattern databases
 // ═════════════════════════════════════════════════════════════════════════════
@@ -361,6 +403,72 @@ struct Pattern {
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Near-solved table: exact distance of every position within D face turns
+// ═════════════════════════════════════════════════════════════════════════════
+// Replaces the last D levels of the search tree by one hash lookup each.
+
+struct NearTable {
+    // 16-byte slots: a = corners (40 bits) | distance << 60, b = edges (60 bits).
+    struct Slot { uint64_t a = ~0ULL, b = 0; };
+    std::vector<Slot> slots;
+    uint64_t mask = 0;
+    int depth = 0;
+
+    static void pack(const CubieCube& c, uint64_t& a, uint64_t& b) {
+        a = 0; b = 0;
+        for (int i = 0; i < 8; ++i) a = (a << 5) | (c.cp[i] << 2) | c.co[i];
+        for (int i = 0; i < 12; ++i) b = (b << 5) | (c.ep[i] << 1) | c.eo[i];
+    }
+    uint64_t slot_of(uint64_t a, uint64_t b) const {
+        uint64_t h = (a * 0x9E3779B97F4A7C15ULL) ^ (b * 0xC2B2AE3D27D4EB4FULL);
+        return (h ^ (h >> 29)) & mask;
+    }
+    static constexpr uint64_t KEY = (1ULL << 40) - 1;
+    // Distance if within the table, else 0xFF.
+    int get(const CubieCube& c) const {
+        uint64_t a, b; pack(c, a, b);
+        for (uint64_t i = slot_of(a, b);; i = (i + 1) & mask) {
+            const Slot& s = slots[i];
+            if (s.a == ~0ULL) return 0xFF;
+            if ((s.a & KEY) == a && s.b == b) return int(s.a >> 60);
+        }
+    }
+    bool insert(const CubieCube& c, int d) {
+        uint64_t a, b; pack(c, a, b);
+        for (uint64_t i = slot_of(a, b);; i = (i + 1) & mask) {
+            Slot& s = slots[i];
+            if (s.a == ~0ULL) { s.a = a | (uint64_t(d) << 60); s.b = b; return true; }
+            if ((s.a & KEY) == a && s.b == b) return false;
+        }
+    }
+    void build(int D) {
+        auto t0 = std::chrono::steady_clock::now();
+        depth = D;
+        uint64_t cap = 1;
+        double expect = 1; for (int d = 1; d <= D; ++d) expect *= 13.35;
+        while (cap < 1.6 * expect) cap <<= 1;
+        slots.assign(cap, Slot{});
+        mask = cap - 1;
+        std::vector<CubieCube> frontier{CubieCube::solved()}, next;
+        insert(frontier[0], 0);
+        uint64_t total = 1;
+        for (int d = 0; d < D; ++d) {
+            next.clear();
+            for (auto& c : frontier)
+                for (int m = 0; m < 18; ++m) {
+                    CubieCube n = c * MOVES[m];
+                    if (insert(n, d + 1)) next.push_back(n);
+                }
+            total += next.size();
+            frontier.swap(next);
+        }
+        auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "  built near-solved table: %llu positions within %d moves, %.1fs\n",
+                     (unsigned long long)total, D, secs);
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
 // IDA*
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -384,9 +492,15 @@ struct Search {
     size_t maxSolutions = 2000;
 
     int cost(int m) const { return (qtm && m % 3 == 1) ? 2 : 1; }
+    std::vector<int> symIdx;  // extra viewpoints for the edge databases
+    const NearTable* near = nullptr;  // HTM only
     int h(const CubieCube& c) const {
         int v = 0;
         for (auto* p : pdbs) v = std::max(v, p->h(c));
+        for (int k : symIdx) {
+            CubieCube t = SYMS_INV[k] * c * SYMS[k];
+            for (auto* p : pdbs) if (!p->corners) v = std::max(v, p->h(t));
+        }
         return v;
     }
     // Disallow U as the first move (pre-AUF is free and searched separately)
@@ -398,7 +512,13 @@ struct Search {
                 solutions.push_back(path);
             return;
         }
-        if (h(c) > left) return;
+        // Within reach of the near-solved table the exact distance is known.
+        // Searches run at the first depth that has solutions, so on every
+        // solution path the remaining distance equals the moves left
+        // (a shorter completion would have given a shorter solution).
+        if (near && left <= near->depth) {
+            if (near->get(c) != left) return;
+        } else if (h(c) > left) return;
         for (int m = 0; m < 18; ++m) {
             int f = m / 3;
             if (path.empty() && f == U) continue;
@@ -570,12 +690,24 @@ static int find_pre_auf(const CubieCube& start, const std::vector<int>& moves, b
     return -1;
 }
 
-static Result solve_case(const Case& cs, bool pll, bool qtm, Search& proto) {
-    Result r{cs.name, cs.alg, parse_alg(cs.alg)};
-    auto t0 = std::chrono::steady_clock::now();
-    Cube3 caseCube = normalize(Cube3::solved().apply(r.info.perm.inverse()));
-    CubieCube start = to_cubie(caseCube);
+struct Hit { int a; std::vector<int> moves; };  // pre-AUF U^a, then moves
+struct StateResult {
+    int opt = -1;
+    std::vector<Hit> hits;  // all optimal solutions found, most comfortable first
+    bool capped = false;
+};
 
+static const char* AUF_NAMES[4] = {"", "U", "U2", "U'"};
+
+static std::string hit_to_string(const Hit& h) {
+    std::string s = moves_to_string(h.moves);
+    return h.a ? std::string("(") + AUF_NAMES[h.a] + ") " + s : s;
+}
+
+// Optimal solutions of a last-layer state (goal: solved up to AUF for
+// Goal::Solved, oriented last layer for Goal::OLL).
+static StateResult solve_state(const CubieCube& start, bool pll, const Search& proto) {
+    StateResult r;
     // For a last-layer state s, U^b s U^a is a y-rotated view of s U^(a+b),
     // so only a+b matters: PLL needs the 4 pre-AUFs, OLL (which ignores the
     // last-layer permutation, i.e. both AUFs) just one.
@@ -598,40 +730,46 @@ static Result solve_case(const Case& cs, bool pll, bool qtm, Search& proto) {
         }
         if (!found.empty()) r.opt = depth;
     }
+    r.capped = found.size() >= proto.maxSolutions;
 
     // Every optimal solution can also be performed from the other three
-    // sides (y-conjugates). Collect them all and pick the most comfortable.
+    // sides (y-conjugates). Collect them all.
     std::set<std::vector<int>> all;
     for (auto sol : found)
         for (int c = 0; c < 4; ++c) {
             all.insert(sol);
             for (int& m : sol) m = YMAP[m / 3] * 3 + m % 3;
         }
-    struct Hit { int a; std::vector<int> moves; };
-    std::vector<Hit> hits;
+    Cube3 caseCube = from_cubie(start);
     for (auto& sol : all) {
         int a = find_pre_auf(start, sol, pll);
-        if (a < 0) throw std::runtime_error("conjugated solution does not solve " + cs.name);
-        hits.push_back({a, sol});
+        if (a < 0) throw std::runtime_error("conjugated solution does not solve the case");
+        Hit h{a, sol};
+        // Independent check on the sticker model.
+        Cube3 c = caseCube.apply(parse_alg(hit_to_string(h)).perm);
+        bool ok = false;
+        for (int b = 0; b < 4; ++b) {
+            Cube3 d = c.apply(parse_alg(AUF_NAMES[b]).perm);
+            ok |= pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
+        }
+        if (!ok) throw std::runtime_error("solution failed sticker verification: " + hit_to_string(h));
+        r.hits.push_back(h);
     }
-    std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) {
+    std::stable_sort(r.hits.begin(), r.hits.end(), [](const Hit& x, const Hit& y) {
         return ergonomics(x.moves) < ergonomics(y.moves);
     });
-    r.optCount = hits.size();
-    r.capped = found.size() >= proto.maxSolutions;
-    const Hit& h = hits.front();
-    r.optAlg = moves_to_string(h.moves);
+    return r;
+}
 
-    // Independent check on the sticker model.
-    static const char* auf[4] = {"", "U", "U2", "U'"};
-    Cube3 c = caseCube.apply(parse_alg(std::string(auf[h.a]) + " " + r.optAlg).perm);
-    bool ok = false;
-    for (int b = 0; b < 4; ++b) {
-        Cube3 d = c.apply(parse_alg(auf[b]).perm);
-        ok |= pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
-    }
-    if (!ok) throw std::runtime_error("optimal solution failed sticker verification: " + cs.name);
-    if (h.a) r.optAlg = std::string("(") + auf[h.a] + ") " + r.optAlg;
+static Result solve_case(const Case& cs, bool pll, const Search& proto) {
+    Result r{cs.name, cs.alg, parse_alg(cs.alg)};
+    auto t0 = std::chrono::steady_clock::now();
+    Cube3 caseCube = normalize(Cube3::solved().apply(r.info.perm.inverse()));
+    StateResult sr = solve_state(to_cubie(caseCube), pll, proto);
+    r.opt = sr.opt;
+    r.optCount = sr.hits.size();
+    r.capped = sr.capped;
+    r.optAlg = hit_to_string(sr.hits.front());
     r.secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return r;
 }
@@ -660,19 +798,145 @@ static void validate(const std::vector<Case>& cases, bool pll) {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ZBLL: every last-layer case with oriented edges, for fewest-moves use
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct ZbllCase { std::string set; int index; CubieCube state; };
+
+// Corner-orientation key of a state up to AUF (identifies the ZBLL subset).
+static std::string co_key(const CubieCube& s) {
+    std::string best;
+    for (int a = 0; a < 4; ++a) {
+        CubieCube t = s * U_POW[a];
+        std::string k;
+        for (int i = 0; i < 4; ++i) k += char('0' + t.co[i]);
+        if (best.empty() || k < best) best = k;
+    }
+    return best;
+}
+
+static std::vector<ZbllCase> enumerate_zbll() {
+    // Subsets are named after the OCLL case that has the same corner pattern.
+    std::map<std::string, std::string> setName;
+    const std::pair<const char*, const char*> ocll[] = {
+        {"21", "H"}, {"22", "Pi"}, {"23", "U"}, {"24", "T"}, {"25", "L"}, {"26", "AS"}, {"27", "S"}};
+    for (auto [num, name] : ocll)
+        for (auto& cs : OLL) if (cs.name == num)
+            setName[co_key(to_cubie(normalize(Cube3::solved().apply(parse_alg(cs.alg).perm.inverse()))))] = name;
+    setName["0000"] = "PLL";
+
+    std::map<std::string, CubieCube> classes;  // case key → representative
+    std::array<int, 4> cp = {0, 1, 2, 3};
+    do {
+        std::array<int, 4> ep = {0, 1, 2, 3};
+        do {
+            for (int co = 0; co < 27; ++co) {
+                CubieCube c = CubieCube::solved();
+                int sum = 0, x = co;
+                for (int i = 0; i < 3; ++i) { c.co[i] = x % 3; x /= 3; sum += c.co[i]; }
+                c.co[3] = (3 - sum % 3) % 3;
+                for (int i = 0; i < 4; ++i) { c.cp[i] = cp[i]; c.ep[i] = ep[i]; }
+                // corner and edge permutation parities must match
+                auto parity = [](const std::array<int,4>& p) {
+                    int inv = 0;
+                    for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j) inv += p[i] > p[j];
+                    return inv & 1;
+                };
+                if (parity(cp) != parity(ep)) continue;
+                if (c == CubieCube::solved()) continue;
+                std::string key = case_key(c, true);
+                if (key == case_key(CubieCube::solved(), true)) continue;
+                classes.emplace(key, c);
+            }
+        } while (std::next_permutation(ep.begin(), ep.end()));
+    } while (std::next_permutation(cp.begin(), cp.end()));
+
+    std::map<std::string, int> counter;
+    std::vector<ZbllCase> out;
+    for (auto& [key, c] : classes) {
+        std::string set = setName.at(co_key(c));
+        out.push_back({set, ++counter[set], c});
+    }
+    std::stable_sort(out.begin(), out.end(), [](const ZbllCase& x, const ZbllCase& y) {
+        static const std::vector<std::string> order = {"T", "U", "L", "H", "Pi", "S", "AS", "PLL"};
+        auto ix = [&](const std::string& s) { return std::find(order.begin(), order.end(), s) - order.begin(); };
+        return ix(x.set) < ix(y.set);
+    });
+    return out;
+}
+
+static std::string invert_moves(const std::vector<int>& p) {
+    std::vector<int> r;
+    for (auto it = p.rbegin(); it != p.rend(); ++it) r.push_back(*it / 3 * 3 + (2 - *it % 3));
+    return moves_to_string(r);
+}
+
+// Output:
+//   stdout            markdown summary + one row per case
+//   <dataFile>        every optimal solution of every case (one per line)
+static void run_zbll(const Search& proto, const std::string& dataFile, int from, int to) {
+    auto cases = enumerate_zbll();
+    std::map<std::string, int> sizes;
+    for (auto& c : cases) sizes[c.set]++;
+    std::fprintf(stderr, "ZBLL cases: %zu (", cases.size());
+    for (auto& [k, v] : sizes) std::fprintf(stderr, "%s %d ", k.c_str(), v);
+    std::fprintf(stderr, ")\n");
+
+    std::ofstream data(dataFile, std::ios::app);
+    std::printf("| Case | Optimal HTM | # optimal | First faces | Last faces | Setup (inverse of a solution) | Shortest, most comfortable solution |\n");
+    std::printf("|---|--:|--:|---|---|---|---|\n");
+    for (int i = from; i < (int)cases.size() && i < to; ++i) {
+        auto& zc = cases[i];
+        auto t0 = std::chrono::steady_clock::now();
+        StateResult r = solve_state(zc.state, true, proto);
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::string name = zc.set + "-" + std::to_string(zc.index);
+        std::set<char> first, last;
+        for (auto& h : r.hits) { first.insert(FACE_NAMES[h.moves.front() / 3]); last.insert(FACE_NAMES[h.moves.back() / 3]); }
+        std::string fs(first.begin(), first.end()), ls(last.begin(), last.end());
+        // Setup: undo the chosen solution, then its pre-AUF.
+        const Hit& best = r.hits.front();
+        std::string setup = invert_moves(best.moves);
+        if (best.a) setup += std::string(" ") + AUF_NAMES[(4 - best.a) % 4];
+        std::printf("| %s | **%d** | %zu%s | %s | %s | `%s` | `%s` |\n", name.c_str(), r.opt, r.hits.size(),
+                    r.capped ? "+" : "", fs.c_str(), ls.c_str(), setup.c_str(), hit_to_string(best).c_str());
+        std::fflush(stdout);
+        data << "# " << name << "  optimal " << r.opt << " HTM  setup: " << setup << "\n";
+        for (auto& h : r.hits) data << hit_to_string(h) << "\n";
+        data.flush();
+        std::fprintf(stderr, "  %s: %d, %zu solutions (%.1fs)\n", name.c_str(), r.opt, r.hits.size(), secs);
+    }
+}
+
 int main(int argc, char** argv) {
-    std::string which = "all", cacheDir = ".";
+    std::string which = "all", cacheDir = ".", only;
     bool qtm = false;
+    int syms = 0, nearDepth = 6, zbllFrom = 0, zbllTo = 1 << 30;
+    std::string zbllData = "zbll_solutions.txt";
+    NearTable near;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--qtm") qtm = true;
         else if (a == "--cache" && i + 1 < argc) cacheDir = argv[++i];
+        else if (a == "--syms" && i + 1 < argc) syms = std::atoi(argv[++i]);
+        else if (a == "--only" && i + 1 < argc) only = argv[++i];
+        else if (a == "--near" && i + 1 < argc) nearDepth = std::atoi(argv[++i]);
+        else if (a == "--from" && i + 1 < argc) zbllFrom = std::atoi(argv[++i]);
+        else if (a == "--to" && i + 1 < argc) zbllTo = std::atoi(argv[++i]);
+        else if (a == "--data" && i + 1 < argc) zbllData = argv[++i];
         else which = a;
     }
     init_facelets();
     init_moves();
     init_ymap();
+    init_syms();
     for (int i = 0; i < 4; ++i) U_POW[i] = i ? U_POW[i - 1] * MOVES[U * 3] : CubieCube::solved();
+    {   // round trip sanity check of the two cube models
+        CubieCube c = CubieCube::solved();
+        for (int m : {5, 9, 13, 1, 17, 7, 3, 11, 15}) c = c * MOVES[m];
+        if (!(to_cubie(from_cubie(c)) == c)) { std::cerr << "cubie/sticker round trip failed\n"; return 1; }
+    }
 
     try {
         validate(PLL, true);
@@ -700,11 +964,17 @@ int main(int argc, char** argv) {
         search.pdbs = pdbs;
         search.goal = pll ? Goal::Solved : Goal::OLL;
         search.qtm = qtm;
+        for (int k = 1; k <= syms && k < (int)SYMS.size(); ++k) search.symIdx.push_back(k);
+        if (!qtm && nearDepth > 0) {
+            if (near.depth != nearDepth) near.build(nearDepth);
+            search.near = &near;
+        }
         std::printf("\n%s  (optimal in %s, AUF free)\n", pll ? "PLL" : "OLL", metric);
         std::printf("| Case | Common algorithm | HTM | STM | QTM | Optimal %s | # optimal | An optimal solution |\n", metric);
         std::printf("|---|---|---|---|---|---|---|---|\n");
         for (auto& cs : cases) {
-            Result r = solve_case(cs, pll, qtm, search);
+            if (!only.empty() && cs.name != only) continue;
+            Result r = solve_case(cs, pll, search);
             std::printf("| %s | `%s` | %d | %d | %d | **%d** | %zu%s | `%s` |\n", r.name.c_str(),
                         r.alg.c_str(), r.info.htm, r.info.stm, r.info.qtm, r.opt, r.optCount,
                         r.capped ? "+" : "", r.optAlg.c_str());
@@ -714,6 +984,14 @@ int main(int argc, char** argv) {
         for (auto* p : pdbs) { p->dist.clear(); p->dist.shrink_to_fit(); }
     };
     if (which == "pll" || which == "all") run(PLL, true, {&pllC, &pllE1, &pllE2});
+    if (which == "zbll") {
+        for (auto* p : {&pllC, &pllE1, &pllE2}) p->build(cacheDir);
+        Search search;
+        search.pdbs = {&pllC, &pllE1, &pllE2};
+        search.goal = Goal::Solved;
+        if (nearDepth > 0) { near.build(nearDepth); search.near = &near; }
+        run_zbll(search, zbllData, zbllFrom, zbllTo);
+    }
     if (which == "oll" || which == "all") run(OLL, false, {&ollC, &ollE1, &ollE2});
     return 0;
 }
