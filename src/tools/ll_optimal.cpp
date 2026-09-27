@@ -14,15 +14,23 @@
 //   QTM  (quarter turn metric): quarter turn = 1, half turn = 2
 // Pre- and post-AUF (U turns before / after) are free, as is customary.
 //
-// Usage: ll_optimal [pll|oll|all] [--qtm] [--cache DIR] [--only CASE]
-//        ll_optimal zbll [--near 7] [--from I] [--to J] [--data FILE]
-//   zbll: every last-layer case with oriented edges (493), all optimal
-//         solutions written to FILE (default zbll_solutions.txt), for FMC.
-//   --near D: exact table of all positions within D moves (default 6;
-//             7 needs ~4 GB) that replaces the last D levels of each search.
+// Usage: ll_optimal [pll|oll|all] [--stm|--qtm] [--cache DIR] [--only CASE]
+//        ll_optimal zbll [--stm|--qtm] [--near D] [--from I] [--to J] [--data FILE]
+//                        [--plus N] [--plus-max-opt K]
+//        ll_optimal finish "<scramble>" "<skeleton>" [--back K]
+//   zbll:   every last-layer case with oriented edges (493); all optimal
+//           solutions (with pre- and post-AUF) are written to FILE, and with
+//           --plus N also all solutions up to N moves longer (FILE.plus1 ...)
+//           for cases whose optimum is at most K (default 13).
+//   finish: FMC helper (HTM, nothing free): drops the last 0..K skeleton moves
+//           and finds every optimal finish, ranking them by the total length
+//           after cancellation at the join.
+//   --stm / --qtm: slice turn metric (M, E, S count 1) / quarter turn metric.
+//   --near D: exact table of all positions within D moves that replaces the
+//             last D levels of each search (default 6; 7 in HTM needs ~4 GB).
 //   --syms K: also consult the edge databases from K rotated viewpoints
 //             (admissible but slower on this hardware; default 0).
-// The pattern databases (~1.2 GB) are built on first run and cached on disk.
+// The pattern databases (~1.2 GB per metric) are built on first run and cached.
 
 #include "cube.h"
 #include "moves.h"
@@ -267,6 +275,46 @@ static void init_syms() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Metrics and the search move set
+// ═════════════════════════════════════════════════════════════════════════════
+// Searches run in the frame of the centers. There a slice move is the same as
+// turning the two faces beside it the other way (M ≡ L' R, up to a whole-cube
+// rotation) and a wide move the same as the opposite face turn (r ≡ L), so all
+// metrics can be expressed with face turns. A search move is any non-trivial
+// turn of one axis — U^a D^b, F^a B^b or L^a R^b — and consecutive search
+// moves use different axes, which removes the trivial redundancies.
+
+enum Metric { HTM = 0, STM = 1, QTM = 2 };
+static const char* METRIC_NAMES[3] = {"HTM", "STM", "QTM"};
+
+struct AxisMove { CubieCube c; int axis, a, b; int cost[3]; };
+static std::vector<AxisMove> MV;
+static int MV_ID[3][4][4];
+
+static void init_axis_moves() {
+    auto qt = [](int p) { return p == 0 ? 0 : p == 2 ? 2 : 1; };
+    for (int ax = 0; ax < 3; ++ax)
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b) {
+                MV_ID[ax][a][b] = -1;
+                if (!a && !b) continue;
+                AxisMove m;
+                m.axis = ax; m.a = a; m.b = b;
+                m.c = CubieCube::solved();
+                if (a) m.c = m.c * MOVES[(2 * ax) * 3 + a - 1];
+                if (b) m.c = m.c * MOVES[(2 * ax + 1) * 3 + b - 1];
+                m.cost[HTM] = (a > 0) + (b > 0);
+                m.cost[QTM] = qt(a) + qt(b);
+                m.cost[STM] = (a && b && (a + b) % 4 == 0) ? 1 : m.cost[HTM];  // slice
+                MV_ID[ax][a][b] = (int)MV.size();
+                MV.push_back(m);
+            }
+}
+
+// A move whose U/D-axis part includes a U turn (absorbed by AUF).
+static bool has_U_part(int m) { return MV[m].axis == 0 && MV[m].a != 0; }
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Pattern databases
 // ═════════════════════════════════════════════════════════════════════════════
 // A pattern tracks the positions (and twists) of a subset of pieces of one kind.
@@ -353,8 +401,9 @@ struct Pattern {
         }
     }
 
-    void build(const std::string& cacheDir) {
-        std::string file = cacheDir + "/" + name + ".pdb";
+    void build(const std::string& cacheDir, Metric metric) {
+        static const char* suffix[3] = {"", "_stm", "_qtm"};
+        std::string file = cacheDir + "/" + name + suffix[metric] + ".pdb";
         {
             std::ifstream in(file, std::ios::binary);
             if (in) {
@@ -376,8 +425,9 @@ struct Pattern {
                 if (dist[i] != d) continue;
                 uint8_t p[12], o[12];
                 decode(i, p, o);
-                for (int m = 0; m < 18; ++m) {
-                    const auto& mv = MOVES[m];
+                for (const auto& am : MV) {
+                    if (am.cost[metric] != 1) continue;
+                    const auto& mv = am.c;
                     const uint8_t* mp = corners ? mv.cp : mv.ep;
                     const uint8_t* mo = corners ? mv.co : mv.eo;
                     uint8_t np[12], no[12];
@@ -393,7 +443,8 @@ struct Pattern {
         }
         uint64_t unreached = std::count(dist.begin(), dist.end(), (uint8_t)0xFF);
         auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "  built %-12s %11llu entries, max depth %d, %.1fs%s\n", name.c_str(),
+        std::fprintf(stderr, "  built %-12s %s %11llu entries, max depth %d, %.1fs%s\n", name.c_str(),
+                     METRIC_NAMES[metric],
                      (unsigned long long)size(), *std::max_element(dist.begin(), dist.end()),
                      secs, unreached ? " (UNREACHED ENTRIES!)" : "");
         std::ofstream out(file, std::ios::binary);
@@ -441,11 +492,12 @@ struct NearTable {
             if ((s.a & KEY) == a && s.b == b) return false;
         }
     }
-    void build(int D) {
+    void build(int D, Metric metric) {
         auto t0 = std::chrono::steady_clock::now();
         depth = D;
         uint64_t cap = 1;
-        double expect = 1; for (int d = 1; d <= D; ++d) expect *= 13.35;
+        static const double branching[3] = {13.35, 19.0, 9.4};  // rough growth per level
+        double expect = 1; for (int d = 1; d <= D; ++d) expect *= branching[metric];
         while (cap < 1.6 * expect) cap <<= 1;
         slots.assign(cap, Slot{});
         mask = cap - 1;
@@ -455,16 +507,18 @@ struct NearTable {
         for (int d = 0; d < D; ++d) {
             next.clear();
             for (auto& c : frontier)
-                for (int m = 0; m < 18; ++m) {
-                    CubieCube n = c * MOVES[m];
+                for (const auto& am : MV) {
+                    if (am.cost[metric] != 1) continue;
+                    CubieCube n = c * am.c;
                     if (insert(n, d + 1)) next.push_back(n);
                 }
             total += next.size();
+            if (total > 0.9 * cap) throw std::runtime_error("near-solved table too full; lower --near");
             frontier.swap(next);
         }
         auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "  built near-solved table: %llu positions within %d moves, %.1fs\n",
-                     (unsigned long long)total, D, secs);
+        std::fprintf(stderr, "  built near-solved table: %llu positions within %d %s, %.1fs\n",
+                     (unsigned long long)total, D, METRIC_NAMES[metric], secs);
     }
 };
 
@@ -486,14 +540,15 @@ static bool is_goal(const CubieCube& c, Goal g) {
 struct Search {
     std::vector<Pattern*> pdbs;
     Goal goal;
-    bool qtm = false;
+    Metric metric = HTM;
     std::vector<int> path;
     std::vector<std::vector<int>> solutions;
     size_t maxSolutions = 2000;
 
-    int cost(int m) const { return (qtm && m % 3 == 1) ? 2 : 1; }
+    int cost(int m) const { return MV[m].cost[metric]; }
     std::vector<int> symIdx;  // extra viewpoints for the edge databases
-    const NearTable* near = nullptr;  // HTM only
+    const NearTable* near = nullptr;  // built for the same metric
+    bool exact = true;                // searching at the optimal depth
     int h(const CubieCube& c) const {
         int v = 0;
         for (auto* p : pdbs) v = std::max(v, p->h(c));
@@ -503,12 +558,12 @@ struct Search {
         }
         return v;
     }
-    // Disallow U as the first move (pre-AUF is free and searched separately)
-    // and, for PLL, as the last move (post-AUF likewise).
-    void dfs(const CubieCube& c, int left, int last, bool noUlast) {
+    // U is never the first move (pre-AUF is free and searched separately)
+    // and, for PLL, never the last move (post-AUF likewise).
+    void dfs(const CubieCube& c, int left, int lastAxis, bool noUlast) {
         if (solutions.size() >= maxSolutions) return;
         if (left == 0) {
-            if (is_goal(c, goal) && !(noUlast && !path.empty() && path.back() / 3 == U))
+            if (is_goal(c, goal) && !(noUlast && !path.empty() && has_U_part(path.back())))
                 solutions.push_back(path);
             return;
         }
@@ -516,17 +571,17 @@ struct Search {
         // Searches run at the first depth that has solutions, so on every
         // solution path the remaining distance equals the moves left
         // (a shorter completion would have given a shorter solution).
+        // (Beyond the optimal depth, only "at most `left` away" can be required.)
         if (near && left <= near->depth) {
-            if (near->get(c) != left) return;
+            int d = near->get(c);
+            if (exact ? d != left : d > left) return;
         } else if (h(c) > left) return;
-        for (int m = 0; m < 18; ++m) {
-            int f = m / 3;
-            if (path.empty() && f == U) continue;
-            if (last >= 0 && (f == last || (f == (last ^ 1) && f < last))) continue;
+        for (int m = 0; m < (int)MV.size(); ++m) {
+            if (MV[m].axis == lastAxis) continue;
             int cm = cost(m);
             if (cm > left) continue;
             path.push_back(m);
-            dfs(c * MOVES[m], left - cm, f, noUlast);
+            dfs(c * MV[m].c, left - cm, MV[m].axis, noUlast);
             path.pop_back();
         }
     }
@@ -643,18 +698,75 @@ static std::string case_key(const CubieCube& s, bool pll) {
     return best;
 }
 
-static std::string moves_to_string(const std::vector<int>& p) {
+// Search moves → notation. Centers are tracked on a sticker cube so that a
+// slice pair becomes M/E/S and later face turns are named by where their
+// center physically is (for HTM/QTM the centers never move).
+static std::vector<std::string> to_tokens(const std::vector<int>& ids, Metric metric) {
+    static const char* suf[4] = {"", "", "2", "'"};
+    std::vector<std::string> out;
+    Cube3 cube = Cube3::solved();
+    auto where = [&](int center) {
+        for (int p = 0; p < 6; ++p) if (cube.s[Cube3::idx(p, 1, 1)] == center) return p;
+        return -1;
+    };
+    auto emit = [&](const std::string& t) { out.push_back(t); cube = cube.apply(parse_alg(t).perm); };
+    for (int m : ids) {
+        const auto& v = MV[m];
+        int f1 = 2 * v.axis, f2 = f1 + 1;
+        if (metric == STM && v.cost[STM] == 1 && v.a && v.b) {
+            // f1^a f2^b with a+b ≡ 0: the middle layer turns like f1^b.
+            int p = where(f1), q = v.b;
+            char name; int pw;
+            switch (p) {
+                case L: name = 'M'; pw = q; break;
+                case R: name = 'M'; pw = (4 - q) % 4; break;
+                case D: name = 'E'; pw = q; break;
+                case U: name = 'E'; pw = (4 - q) % 4; break;
+                case F: name = 'S'; pw = q; break;
+                default: name = 'S'; pw = (4 - q) % 4; break;
+            }
+            emit(std::string(1, name) + suf[pw]);
+        } else {
+            if (v.a) emit(std::string(1, FACE_NAMES[where(f1)]) + suf[v.a]);
+            if (v.b) emit(std::string(1, FACE_NAMES[where(f2)]) + suf[v.b]);
+        }
+    }
+    return out;
+}
+
+static std::string join(const std::vector<std::string>& t) {
     std::string s;
-    for (int m : p) { if (!s.empty()) s += ' '; s += move_name(m); }
+    for (auto& x : t) { if (!s.empty()) s += ' '; s += x; }
     return s;
 }
 
+static std::string moves_to_string(const std::vector<int>& p, Metric metric = HTM) {
+    return join(to_tokens(p, metric));
+}
+
+static std::vector<std::string> invert_tokens(const std::vector<std::string>& t) {
+    std::vector<std::string> r;
+    for (auto it = t.rbegin(); it != t.rend(); ++it) {
+        std::string x = *it;
+        if (x.size() == 1) x += '\'';
+        else if (x[1] == '\'') x = x.substr(0, 1);
+        r.push_back(x);
+    }
+    return r;
+}
+
 // Rough ergonomics score used to pick one of several optimal solutions:
-// prefer R/U/L/F turns (regrip-free, "RUF" style) over B and D.
-static int ergonomics(const std::vector<int>& p) {
-    static const int w[6] = {0, 3, 1, 4, 1, 0}; // U D F B L R
+// prefer R/U turns, then L/F/M, over B, D, E and S.
+static int ergonomics(const std::vector<std::string>& tokens) {
     int s = 0;
-    for (int m : p) s += w[m / 3];
+    for (auto& t : tokens) {
+        switch (t[0]) {
+            case 'U': case 'R': break;
+            case 'L': case 'F': case 'M': s += 1; break;
+            case 'D': case 'E': case 'S': s += 3; break;
+            default: s += 4;
+        }
+    }
     return s;
 }
 
@@ -683,81 +795,113 @@ static void init_ymap() {
 static int find_pre_auf(const CubieCube& start, const std::vector<int>& moves, bool pll) {
     for (int a = 0; a < 4; ++a) {
         CubieCube c = start * U_POW[a];
-        for (int m : moves) c = c * MOVES[m];
+        for (int m : moves) c = c * MV[m].c;
         if (!pll && is_goal(c, Goal::OLL)) return a;
         if (pll) for (int b = 0; b < 4; ++b) if (c * U_POW[b] == CubieCube::solved()) return a;
     }
     return -1;
 }
 
-struct Hit { int a; std::vector<int> moves; };  // pre-AUF U^a, then moves
+// Pre-AUF U^a, then moves, then post-AUF U^b.
+struct Hit { int a; std::vector<int> moves; std::vector<std::string> tokens; int b = 0; };
 struct StateResult {
     int opt = -1;
     std::vector<Hit> hits;  // all optimal solutions found, most comfortable first
     bool capped = false;
+    std::vector<std::vector<Hit>> plus;  // plus[i]: all solutions of length opt+1+i
 };
 
 static const char* AUF_NAMES[4] = {"", "U", "U2", "U'"};
 
-static std::string hit_to_string(const Hit& h) {
-    std::string s = moves_to_string(h.moves);
-    return h.a ? std::string("(") + AUF_NAMES[h.a] + ") " + s : s;
+static std::string hit_to_string(const Hit& h, bool withPost = false) {
+    std::string s = join(h.tokens);
+    if (h.a) s = std::string("(") + AUF_NAMES[h.a] + ") " + s;
+    if (withPost && h.b) s += std::string(" (") + AUF_NAMES[h.b] + ")";
+    return s;
 }
 
 // Optimal solutions of a last-layer state (goal: solved up to AUF for
 // Goal::Solved, oriented last layer for Goal::OLL).
-static StateResult solve_state(const CubieCube& start, bool pll, const Search& proto) {
+static StateResult solve_state(const CubieCube& start, bool pll, const Search& proto,
+                               int plus = 0, int plusMaxOpt = 99) {
     StateResult r;
     // For a last-layer state s, U^b s U^a is a y-rotated view of s U^(a+b),
     // so only a+b matters: PLL needs the 4 pre-AUFs, OLL (which ignores the
     // last-layer permutation, i.e. both AUFs) just one.
     std::vector<int> variants = pll ? std::vector<int>{0, 1, 2, 3} : std::vector<int>{0};
-    std::vector<std::vector<int>> found;
-    for (int depth = 1; found.empty() && depth <= 30; ++depth) {
+    auto search_depth = [&](int depth, bool exact) {
+        std::vector<std::vector<int>> found;
         // One task per (variant, first move); the first move is never U.
         std::vector<std::pair<int,int>> tasks;
-        for (int a : variants) for (int m = 3; m < 18; ++m) tasks.push_back({a, m});
+        for (int a : variants)
+            for (int m = 0; m < (int)MV.size(); ++m)
+                if (!has_U_part(m)) tasks.push_back({a, m});
         #pragma omp parallel for schedule(dynamic, 1)
         for (int t = 0; t < (int)tasks.size(); ++t) {
             auto [a, m] = tasks[t];
             Search s = proto;
+            s.exact = exact;
+            if (!exact) s.maxSolutions *= 50;
             int cm = s.cost(m);
             if (cm > depth) continue;
             s.path = {m};
-            s.dfs(start * U_POW[a] * MOVES[m], depth - cm, m / 3, pll);
+            s.dfs(start * U_POW[a] * MV[m].c, depth - cm, MV[m].axis, pll);
             #pragma omp critical
             found.insert(found.end(), s.solutions.begin(), s.solutions.end());
         }
+        return found;
+    };
+
+    // Every solution can also be performed from the other three sides
+    // (y-conjugates). Collect them all, and check each on the sticker model.
+    Cube3 caseCube = from_cubie(start);
+    auto expand = [&](const std::vector<std::vector<int>>& found) {
+        std::set<std::vector<int>> all;
+        for (auto sol : found)
+            for (int c = 0; c < 4; ++c) {
+                all.insert(sol);
+                for (int& m : sol) {
+                    const auto& v = MV[m];
+                    int g1 = YMAP[2 * v.axis];  // where the axis' first face goes
+                    m = (g1 % 2 == 0) ? MV_ID[g1 / 2][v.a][v.b] : MV_ID[g1 / 2][v.b][v.a];
+                }
+            }
+        std::vector<Hit> hits;
+        for (auto& sol : all) {
+            int a = find_pre_auf(start, sol, pll);
+            if (a < 0) throw std::runtime_error("conjugated solution does not solve the case");
+            Hit h{a, sol, to_tokens(sol, proto.metric)};
+            // Slices may leave the whole cube rotated, which is fine.
+            Cube3 c = normalize(caseCube.apply(parse_alg(hit_to_string(h)).perm));
+            bool ok = false;
+            for (int b = 0; b < 4 && !ok; ++b) {
+                Cube3 d = c.apply(parse_alg(AUF_NAMES[b]).perm);
+                ok = pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
+                if (ok) h.b = b;
+            }
+            if (!ok) throw std::runtime_error("solution failed sticker verification: " + hit_to_string(h));
+            hits.push_back(h);
+        }
+        std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) {
+            return ergonomics(x.tokens) < ergonomics(y.tokens);
+        });
+        return hits;
+    };
+
+    std::vector<std::vector<int>> found;
+    for (int depth = 1; found.empty() && depth <= 30; ++depth) {
+        found = search_depth(depth, true);
         if (!found.empty()) r.opt = depth;
     }
     r.capped = found.size() >= proto.maxSolutions;
-
-    // Every optimal solution can also be performed from the other three
-    // sides (y-conjugates). Collect them all.
-    std::set<std::vector<int>> all;
-    for (auto sol : found)
-        for (int c = 0; c < 4; ++c) {
-            all.insert(sol);
-            for (int& m : sol) m = YMAP[m / 3] * 3 + m % 3;
+    r.hits = expand(found);
+    if (r.opt <= plusMaxOpt)
+        for (int i = 1; i <= plus; ++i) {
+            // Only the cost-exact solutions of this length (proper ones: the
+            // move rules already exclude trivially padded sequences).
+            auto more = search_depth(r.opt + i, false);
+            r.plus.push_back(expand(more));
         }
-    Cube3 caseCube = from_cubie(start);
-    for (auto& sol : all) {
-        int a = find_pre_auf(start, sol, pll);
-        if (a < 0) throw std::runtime_error("conjugated solution does not solve the case");
-        Hit h{a, sol};
-        // Independent check on the sticker model.
-        Cube3 c = caseCube.apply(parse_alg(hit_to_string(h)).perm);
-        bool ok = false;
-        for (int b = 0; b < 4; ++b) {
-            Cube3 d = c.apply(parse_alg(AUF_NAMES[b]).perm);
-            ok |= pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
-        }
-        if (!ok) throw std::runtime_error("solution failed sticker verification: " + hit_to_string(h));
-        r.hits.push_back(h);
-    }
-    std::stable_sort(r.hits.begin(), r.hits.end(), [](const Hit& x, const Hit& y) {
-        return ergonomics(x.moves) < ergonomics(y.moves);
-    });
     return r;
 }
 
@@ -866,16 +1010,11 @@ static std::vector<ZbllCase> enumerate_zbll() {
     return out;
 }
 
-static std::string invert_moves(const std::vector<int>& p) {
-    std::vector<int> r;
-    for (auto it = p.rbegin(); it != p.rend(); ++it) r.push_back(*it / 3 * 3 + (2 - *it % 3));
-    return moves_to_string(r);
-}
-
 // Output:
 //   stdout            markdown summary + one row per case
 //   <dataFile>        every optimal solution of every case (one per line)
-static void run_zbll(const Search& proto, const std::string& dataFile, int from, int to) {
+static void run_zbll(const Search& proto, const std::string& dataFile, int from, int to,
+                     int plus, int plusMaxOpt) {
     auto cases = enumerate_zbll();
     std::map<std::string, int> sizes;
     for (auto& c : cases) sizes[c.set]++;
@@ -884,40 +1023,140 @@ static void run_zbll(const Search& proto, const std::string& dataFile, int from,
     std::fprintf(stderr, ")\n");
 
     std::ofstream data(dataFile, std::ios::app);
-    std::printf("| Case | Optimal HTM | # optimal | First faces | Last faces | Setup (inverse of a solution) | Shortest, most comfortable solution |\n");
+    std::printf("| Case | Optimal %s | # optimal | First faces | Last faces | Setup (inverse of a solution) | Shortest, most comfortable solution |\n",
+                METRIC_NAMES[proto.metric]);
     std::printf("|---|--:|--:|---|---|---|---|\n");
     for (int i = from; i < (int)cases.size() && i < to; ++i) {
         auto& zc = cases[i];
         auto t0 = std::chrono::steady_clock::now();
-        StateResult r = solve_state(zc.state, true, proto);
+        StateResult r = solve_state(zc.state, true, proto, plus, plusMaxOpt);
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::string name = zc.set + "-" + std::to_string(zc.index);
         std::set<char> first, last;
-        for (auto& h : r.hits) { first.insert(FACE_NAMES[h.moves.front() / 3]); last.insert(FACE_NAMES[h.moves.back() / 3]); }
+        for (auto& h : r.hits) { first.insert(h.tokens.front()[0]); last.insert(h.tokens.back()[0]); }
         std::string fs(first.begin(), first.end()), ls(last.begin(), last.end());
         // Setup: undo the chosen solution, then its pre-AUF.
         const Hit& best = r.hits.front();
-        std::string setup = invert_moves(best.moves);
+        std::string setup = join(invert_tokens(best.tokens));
         if (best.a) setup += std::string(" ") + AUF_NAMES[(4 - best.a) % 4];
         std::printf("| %s | **%d** | %zu%s | %s | %s | `%s` | `%s` |\n", name.c_str(), r.opt, r.hits.size(),
                     r.capped ? "+" : "", fs.c_str(), ls.c_str(), setup.c_str(), hit_to_string(best).c_str());
         std::fflush(stdout);
-        data << "# " << name << "  optimal " << r.opt << " HTM  setup: " << setup << "\n";
-        for (auto& h : r.hits) data << hit_to_string(h) << "\n";
+        data << "# " << name << "  optimal " << r.opt << " " << METRIC_NAMES[proto.metric]
+             << "  setup: " << setup << "\n";
+        for (auto& h : r.hits) data << hit_to_string(h, true) << "\n";
         data.flush();
-        std::fprintf(stderr, "  %s: %d, %zu solutions (%.1fs)\n", name.c_str(), r.opt, r.hits.size(), secs);
+        for (size_t i = 0; i < r.plus.size(); ++i) {
+            std::ofstream more(dataFile + ".plus" + std::to_string(i + 1), std::ios::app);
+            more << "# " << name << "  " << r.opt + 1 + i << " " << METRIC_NAMES[proto.metric]
+                 << " (optimal " << r.opt << ")  setup: " << setup << "\n";
+            for (auto& h : r.plus[i]) more << hit_to_string(h, true) << "\n";
+        }
+        std::fprintf(stderr, "  %s: %d, %zu solutions%s (%.1fs)\n", name.c_str(), r.opt, r.hits.size(),
+                     r.plus.empty() ? "" : (", +1: " + std::to_string(r.plus[0].size())).c_str(), secs);
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FMC finish: best ending for a skeleton, counting cancellations
+// ═════════════════════════════════════════════════════════════════════════════
+// Nothing is free in FMC (AUF included), so this solves to the exact solved
+// state. For k = 0..back it drops the last k skeleton moves and finds every
+// optimal solution from there; the total is the length of skeleton-minus-k
+// followed by the solution after merging turns of the same axis at the join.
+
+// Face-turn tokens → search moves (merging same-axis neighbours).
+static std::vector<int> tokens_to_moves(const std::vector<std::string>& toks) {
+    std::vector<int> out;
+    for (auto& t : toks) {
+        int f = std::string(FACE_NAMES).find(t[0]);
+        if (f < 0 || f > 5) throw std::runtime_error("finish: only face turns (U D F B L R) are supported: " + t);
+        int p = t.size() == 1 ? 1 : t[1] == '2' ? 2 : 3;
+        int ax = f / 2, a = (f % 2 == 0) ? p : 0, b = (f % 2 == 1) ? p : 0;
+        if (!out.empty() && MV[out.back()].axis == ax) {
+            const auto& v = MV[out.back()];
+            a = (a + v.a) % 4; b = (b + v.b) % 4;
+            out.pop_back();
+            if (!a && !b) continue;
+        }
+        out.push_back(MV_ID[ax][a][b]);
+    }
+    return out;
+}
+
+static std::vector<std::string> split(const std::string& s) {
+    std::istringstream in(s);
+    std::vector<std::string> out;
+    for (std::string t; in >> t;) out.push_back(t);
+    return out;
+}
+
+static void run_finish(const Search& proto, const std::string& scramble, const std::string& skeleton, int back) {
+    auto sk = split(skeleton);
+    std::printf("Scramble: %s\nSkeleton: %s (%zu moves)\n\n", scramble.c_str(), skeleton.c_str(), sk.size());
+    int bestTotal = 1 << 30;
+    std::string bestLine;
+    for (int k = 0; k <= back && k <= (int)sk.size(); ++k) {
+        std::vector<std::string> kept(sk.begin(), sk.end() - k);
+        Cube3 cube = Cube3::solved().apply(parse_alg(scramble + " " + join(kept)).perm);
+        CubieCube start = to_cubie(normalize(cube));
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::vector<int>> found;
+        int opt = -1;
+        for (int depth = 0; found.empty() && depth <= 30; ++depth) {
+            if (depth == 0) { if (start == CubieCube::solved()) found.push_back({}); opt = 0; continue; }
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int m = 0; m < (int)MV.size(); ++m) {
+                Search s = proto;
+                int cm = s.cost(m);
+                if (cm > depth) continue;
+                s.path = {m};
+                s.dfs(start * MV[m].c, depth - cm, MV[m].axis, false);
+                #pragma omp critical
+                found.insert(found.end(), s.solutions.begin(), s.solutions.end());
+            }
+            opt = depth;
+        }
+        // Total after merging at the join; keep the best few.
+        struct Fin { int total; std::string text; };
+        std::vector<Fin> fins;
+        for (auto& sol : found) {
+            auto toks = to_tokens(sol, HTM);
+            Cube3 check = cube.apply(parse_alg(join(toks)).perm);
+            if (!normalize(check).is_solved()) throw std::runtime_error("finish failed sticker verification");
+            std::vector<std::string> all = kept;
+            all.insert(all.end(), toks.begin(), toks.end());
+            int total = 0;
+            for (int m : tokens_to_moves(all)) total += MV[m].cost[HTM];
+            fins.push_back({total, join(toks)});
+        }
+        std::sort(fins.begin(), fins.end(), [](const Fin& x, const Fin& y) { return x.total < y.total; });
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("drop last %d: finish needs %d, %zu optimal finishes, best total %d  (%.1fs)\n",
+                    k, opt, fins.size(), fins.empty() ? -1 : fins[0].total, secs);
+        for (size_t i = 0; i < fins.size() && i < 5; ++i)
+            std::printf("    total %2d   %s | %s\n", fins[i].total, join(kept).c_str(), fins[i].text.c_str());
+        if (!fins.empty() && fins[0].total < bestTotal) {
+            bestTotal = fins[0].total;
+            bestLine = join(kept) + " | " + fins[0].text;
+        }
+        std::fflush(stdout);
+    }
+    std::printf("\nBest: %d moves   %s\n", bestTotal, bestLine.c_str());
 }
 
 int main(int argc, char** argv) {
     std::string which = "all", cacheDir = ".", only;
-    bool qtm = false;
+    Metric metric = HTM;
     int syms = 0, nearDepth = 6, zbllFrom = 0, zbllTo = 1 << 30;
     std::string zbllData = "zbll_solutions.txt";
+    std::vector<std::string> positional;
+    int back = 2, plus = 0, plusMaxOpt = 13;
     NearTable near;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--qtm") qtm = true;
+        if (a == "--qtm") metric = QTM;
+        else if (a == "--stm") metric = STM;
         else if (a == "--cache" && i + 1 < argc) cacheDir = argv[++i];
         else if (a == "--syms" && i + 1 < argc) syms = std::atoi(argv[++i]);
         else if (a == "--only" && i + 1 < argc) only = argv[++i];
@@ -925,12 +1164,17 @@ int main(int argc, char** argv) {
         else if (a == "--from" && i + 1 < argc) zbllFrom = std::atoi(argv[++i]);
         else if (a == "--to" && i + 1 < argc) zbllTo = std::atoi(argv[++i]);
         else if (a == "--data" && i + 1 < argc) zbllData = argv[++i];
-        else which = a;
+        else if (a == "--back" && i + 1 < argc) back = std::atoi(argv[++i]);
+        else if (a == "--plus" && i + 1 < argc) plus = std::atoi(argv[++i]);
+        else if (a == "--plus-max-opt" && i + 1 < argc) plusMaxOpt = std::atoi(argv[++i]);
+        else positional.push_back(a);
     }
+    if (!positional.empty()) which = positional[0];
     init_facelets();
     init_moves();
     init_ymap();
     init_syms();
+    init_axis_moves();
     for (int i = 0; i < 4; ++i) U_POW[i] = i ? U_POW[i - 1] * MOVES[U * 3] : CubieCube::solved();
     {   // round trip sanity check of the two cube models
         CubieCube c = CubieCube::solved();
@@ -957,20 +1201,24 @@ int main(int argc, char** argv) {
     Pattern ollE1("oll_edges_d", false, {4,5,6,7}, true);
     Pattern ollE2("oll_edges_e", false, {8,9,10,11}, true);
 
-    const char* metric = qtm ? "QTM" : "HTM";
-    auto run = [&](const std::vector<Case>& cases, bool pll, std::vector<Pattern*> pdbs) {
-        for (auto* p : pdbs) p->build(cacheDir);
+    const char* mname = METRIC_NAMES[metric];
+    auto make_search = [&](std::vector<Pattern*> pdbs, Goal goal) {
+        for (auto* p : pdbs) p->build(cacheDir, metric);
         Search search;
         search.pdbs = pdbs;
-        search.goal = pll ? Goal::Solved : Goal::OLL;
-        search.qtm = qtm;
+        search.goal = goal;
+        search.metric = metric;
         for (int k = 1; k <= syms && k < (int)SYMS.size(); ++k) search.symIdx.push_back(k);
-        if (!qtm && nearDepth > 0) {
-            if (near.depth != nearDepth) near.build(nearDepth);
+        if (nearDepth > 0) {
+            if (near.depth != nearDepth) near.build(nearDepth, metric);
             search.near = &near;
         }
-        std::printf("\n%s  (optimal in %s, AUF free)\n", pll ? "PLL" : "OLL", metric);
-        std::printf("| Case | Common algorithm | HTM | STM | QTM | Optimal %s | # optimal | An optimal solution |\n", metric);
+        return search;
+    };
+    auto run = [&](const std::vector<Case>& cases, bool pll, std::vector<Pattern*> pdbs) {
+        Search search = make_search(pdbs, pll ? Goal::Solved : Goal::OLL);
+        std::printf("\n%s  (optimal in %s, AUF free)\n", pll ? "PLL" : "OLL", mname);
+        std::printf("| Case | Common algorithm | HTM | STM | QTM | Optimal %s | # optimal | An optimal solution |\n", mname);
         std::printf("|---|---|---|---|---|---|---|---|\n");
         for (auto& cs : cases) {
             if (!only.empty() && cs.name != only) continue;
@@ -985,13 +1233,14 @@ int main(int argc, char** argv) {
     };
     if (which == "pll" || which == "all") run(PLL, true, {&pllC, &pllE1, &pllE2});
     if (which == "zbll") {
-        for (auto* p : {&pllC, &pllE1, &pllE2}) p->build(cacheDir);
-        Search search;
-        search.pdbs = {&pllC, &pllE1, &pllE2};
-        search.goal = Goal::Solved;
-        if (nearDepth > 0) { near.build(nearDepth); search.near = &near; }
-        run_zbll(search, zbllData, zbllFrom, zbllTo);
+        Search search = make_search({&pllC, &pllE1, &pllE2}, Goal::Solved);
+        run_zbll(search, zbllData, zbllFrom, zbllTo, plus, plusMaxOpt);
     }
     if (which == "oll" || which == "all") run(OLL, false, {&ollC, &ollE1, &ollE2});
+    if (which == "finish") {
+        if (positional.size() != 3) { std::cerr << "usage: ll_optimal finish \"<scramble>\" \"<skeleton>\" [--back K]\n"; return 1; }
+        Search search = make_search({&pllC, &pllE1, &pllE2}, Goal::Solved);
+        run_finish(search, positional[1], positional[2], back);
+    }
     return 0;
 }
