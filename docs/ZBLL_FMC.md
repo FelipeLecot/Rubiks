@@ -41,6 +41,29 @@ Files:
   grouping by pre/post AUF gives exactly **493** cases (T, U, L, Pi, S, AS
   72 each, H 40, PLL 21), the known ZBLL count.
 
+## Observations
+
+- **The hardest cases have comfortable optimal solutions.** Both 15-movers
+  have optimal solutions in only three faces. T-65's optimal solutions
+  include `R2 F R U R' U' R' F' R' U' R2 U2 R U2 R`, which is <R,U,F> only
+  and contains the familiar `R U R' U'` trigger. Of the 46 cases needing 14+
+  moves, only 4 force B or D. The mid-length cases (9–13 moves) are where
+  optimality costs ergonomics.
+- **35% of cases (175) need B or D.** For those, every optimal solution,
+  done from any side, uses a B or D turn. 144 cases require D in every
+  optimal solution.
+- **Face usage:** 28 cases have a 2-gen <R,U> optimal solution, 168 have one
+  in <R,U,F>, and 318 have one avoiding B and D entirely.
+- **140 cases have an essentially unique optimal solution** (the same move
+  sequence, done from any of the four sides). For FMC these are the ones where
+  a cancellation has to come from AUF alone, or from a solution one move
+  longer.
+- **44% of cases (216): every optimal solution starts and ends on the same
+  face**, e.g. `F … F'`, `R … R'`, the setup–commutator–undo shape. That's
+  good for FMC: a skeleton ending in that face can cancel on both sides of an
+  inverse-scramble (NISS) trick.
+- Only 39 cases have an optimal solution without any half turn.
+
 ## How the numbers are proven
 
 - IDA* over face turns. The lower bound is an exact 8-corner pattern database
