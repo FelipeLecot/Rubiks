@@ -43,6 +43,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -572,7 +573,7 @@ struct Search {
         // solution path the remaining distance equals the moves left
         // (a shorter completion would have given a shorter solution).
         // (Beyond the optimal depth, only "at most `left` away" can be required.)
-        if (near && left <= near->depth) {
+        if (near && goal == Goal::Solved && left <= near->depth) {
             int d = near->get(c);
             if (exact ? d != left : d > left) return;
         } else if (h(c) > left) return;
@@ -822,6 +823,44 @@ static std::string hit_to_string(const Hit& h, bool withPost = false) {
 
 // Optimal solutions of a last-layer state (goal: solved up to AUF for
 // Goal::Solved, oriented last layer for Goal::OLL).
+// Every solution can also be performed from the other three sides
+// (y-conjugates). Collect them all, find their AUFs and check each on the
+// sticker model; most comfortable first.
+static std::vector<Hit> expand_hits(const CubieCube& start, bool pll, Metric metric,
+                                    const std::vector<std::vector<int>>& found) {
+    Cube3 caseCube = from_cubie(start);
+    std::set<std::vector<int>> all;
+    for (auto sol : found)
+        for (int c = 0; c < 4; ++c) {
+            all.insert(sol);
+            for (int& m : sol) {
+                const auto& v = MV[m];
+                int g1 = YMAP[2 * v.axis];  // where the axis' first face goes
+                m = (g1 % 2 == 0) ? MV_ID[g1 / 2][v.a][v.b] : MV_ID[g1 / 2][v.b][v.a];
+            }
+        }
+    std::vector<Hit> hits;
+    for (auto& sol : all) {
+        int a = find_pre_auf(start, sol, pll);
+        if (a < 0) throw std::runtime_error("conjugated solution does not solve the case");
+        Hit h{a, sol, to_tokens(sol, metric)};
+        // Slices may leave the whole cube rotated, which is fine.
+        Cube3 c = normalize(caseCube.apply(parse_alg(hit_to_string(h)).perm));
+        bool ok = false;
+        for (int b = 0; b < 4 && !ok; ++b) {
+            Cube3 d = c.apply(parse_alg(AUF_NAMES[b]).perm);
+            ok = pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
+            if (ok) h.b = b;
+        }
+        if (!ok) throw std::runtime_error("solution failed sticker verification: " + hit_to_string(h));
+        hits.push_back(h);
+    }
+    std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) {
+        return ergonomics(x.tokens) < ergonomics(y.tokens);
+    });
+    return hits;
+}
+
 static StateResult solve_state(const CubieCube& start, bool pll, const Search& proto,
                                int plus = 0, int plusMaxOpt = 99) {
     StateResult r;
@@ -852,40 +891,8 @@ static StateResult solve_state(const CubieCube& start, bool pll, const Search& p
         return found;
     };
 
-    // Every solution can also be performed from the other three sides
-    // (y-conjugates). Collect them all, and check each on the sticker model.
-    Cube3 caseCube = from_cubie(start);
     auto expand = [&](const std::vector<std::vector<int>>& found) {
-        std::set<std::vector<int>> all;
-        for (auto sol : found)
-            for (int c = 0; c < 4; ++c) {
-                all.insert(sol);
-                for (int& m : sol) {
-                    const auto& v = MV[m];
-                    int g1 = YMAP[2 * v.axis];  // where the axis' first face goes
-                    m = (g1 % 2 == 0) ? MV_ID[g1 / 2][v.a][v.b] : MV_ID[g1 / 2][v.b][v.a];
-                }
-            }
-        std::vector<Hit> hits;
-        for (auto& sol : all) {
-            int a = find_pre_auf(start, sol, pll);
-            if (a < 0) throw std::runtime_error("conjugated solution does not solve the case");
-            Hit h{a, sol, to_tokens(sol, proto.metric)};
-            // Slices may leave the whole cube rotated, which is fine.
-            Cube3 c = normalize(caseCube.apply(parse_alg(hit_to_string(h)).perm));
-            bool ok = false;
-            for (int b = 0; b < 4 && !ok; ++b) {
-                Cube3 d = c.apply(parse_alg(AUF_NAMES[b]).perm);
-                ok = pll ? d.is_solved() : is_goal(to_cubie(d), Goal::OLL);
-                if (ok) h.b = b;
-            }
-            if (!ok) throw std::runtime_error("solution failed sticker verification: " + hit_to_string(h));
-            hits.push_back(h);
-        }
-        std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) {
-            return ergonomics(x.tokens) < ergonomics(y.tokens);
-        });
-        return hits;
+        return expand_hits(start, pll, proto.metric, found);
     };
 
     std::vector<std::vector<int>> found;
@@ -1010,9 +1017,46 @@ static std::vector<ZbllCase> enumerate_zbll() {
     return out;
 }
 
+// Mirror (left-right reflection) and inverse of a search-move sequence. If W
+// solves a case, mirror(W) solves the mirrored case and inverse(W) the
+// inverse case, and optimal solutions map one-to-one — so only about a
+// quarter of the cases need a search.
+static int neg(int p) { return (4 - p) % 4; }
+static std::vector<int> mirror_moves(const std::vector<int>& p) {
+    std::vector<int> r;
+    for (int m : p) {
+        const auto& v = MV[m];  // L^a R^b ↔ L^-b R^-a; other axes just reverse
+        r.push_back(v.axis == 2 ? MV_ID[2][neg(v.b)][neg(v.a)] : MV_ID[v.axis][neg(v.a)][neg(v.b)]);
+    }
+    return r;
+}
+static std::vector<int> inverse_moves(const std::vector<int>& p) {
+    std::vector<int> r;
+    for (auto it = p.rbegin(); it != p.rend(); ++it) {
+        const auto& v = MV[*it];
+        r.push_back(MV_ID[v.axis][neg(v.a)][neg(v.b)]);
+    }
+    return r;
+}
+// Transform 1 = mirror, 2 = inverse, 3 = both. Returns (pre-AUF, moves, post-AUF).
+static Hit transform_hit(const Hit& h, int t) {
+    Hit r{h.a, h.moves, {}, h.b};
+    if (t & 1) { r.moves = mirror_moves(r.moves); r.a = neg(r.a); r.b = neg(r.b); }
+    if (t & 2) { r.moves = inverse_moves(r.moves); std::swap(r.a, r.b); r.a = neg(r.a); r.b = neg(r.b); }
+    return r;
+}
+// The state that (U^a) W (U^b) solves.
+static CubieCube solved_by(const Hit& h) {
+    CubieCube c = U_POW[h.a];
+    for (int m : h.moves) c = c * MV[m].c;
+    return inverse(c * U_POW[h.b]);
+}
+
 // Output:
 //   stdout            markdown summary + one row per case
 //   <dataFile>        every optimal solution of every case (one per line)
+static size_t pl_size(const StateResult& r) { return r.plus.size(); }
+
 static void run_zbll(const Search& proto, const std::string& dataFile, int from, int to,
                      int plus, int plusMaxOpt) {
     auto cases = enumerate_zbll();
@@ -1026,10 +1070,44 @@ static void run_zbll(const Search& proto, const std::string& dataFile, int from,
     std::printf("| Case | Optimal %s | # optimal | First faces | Last faces | Setup (inverse of a solution) | Shortest, most comfortable solution |\n",
                 METRIC_NAMES[proto.metric]);
     std::printf("|---|--:|--:|---|---|---|---|\n");
+    std::map<std::string, int> byKey;
+    for (int i = 0; i < (int)cases.size(); ++i) byKey[case_key(cases[i].state, true)] = i;
+    std::vector<std::unique_ptr<StateResult>> results(cases.size());
+    std::vector<std::string> origin(cases.size());
+    auto name_of = [&](int i) { return cases[i].set + "-" + std::to_string(cases[i].index); };
     for (int i = from; i < (int)cases.size() && i < to; ++i) {
         auto& zc = cases[i];
         auto t0 = std::chrono::steady_clock::now();
-        StateResult r = solve_state(zc.state, true, proto, plus, plusMaxOpt);
+        if (!results[i]) {
+            results[i] = std::make_unique<StateResult>(solve_state(zc.state, true, proto, plus, plusMaxOpt));
+            origin[i] = "searched";
+            // Derive the mirror / inverse / mirror-inverse images.
+            static const char* tname[4] = {"", "mirror", "inverse", "mirror inverse"};
+            for (int t = 1; t <= 3; ++t) {
+                const StateResult& src = *results[i];
+                auto key = case_key(solved_by(transform_hit(src.hits.front(), t)), true);
+                auto it = byKey.find(key);
+                if (it == byKey.end()) throw std::runtime_error("image case not found");
+                int j = it->second;
+                if (results[j] || j < from || j >= to) continue;
+                auto map_all = [&](const std::vector<Hit>& hs) {
+                    std::vector<std::vector<int>> out;
+                    for (auto& h : hs) out.push_back(transform_hit(h, t).moves);
+                    return expand_hits(cases[j].state, true, proto.metric, out);
+                };
+                auto d = std::make_unique<StateResult>();
+                d->opt = src.opt;
+                d->capped = src.capped;
+                d->hits = map_all(src.hits);
+                for (auto& pl : src.plus) d->plus.push_back(map_all(pl));
+                bool same = d->hits.size() == src.hits.size();
+                for (size_t k = 0; k < pl_size(src) && same; ++k) same = d->plus[k].size() == src.plus[k].size();
+                if (!same) throw std::runtime_error("symmetry changed the number of solutions");
+                results[j] = std::move(d);
+                origin[j] = std::string(tname[t]) + " of " + name_of(i);
+            }
+        }
+        const StateResult& r = *results[i];
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::string name = zc.set + "-" + std::to_string(zc.index);
         std::set<char> first, last;
@@ -1052,8 +1130,9 @@ static void run_zbll(const Search& proto, const std::string& dataFile, int from,
                  << " (optimal " << r.opt << ")  setup: " << setup << "\n";
             for (auto& h : r.plus[i]) more << hit_to_string(h, true) << "\n";
         }
-        std::fprintf(stderr, "  %s: %d, %zu solutions%s (%.1fs)\n", name.c_str(), r.opt, r.hits.size(),
-                     r.plus.empty() ? "" : (", +1: " + std::to_string(r.plus[0].size())).c_str(), secs);
+        std::fprintf(stderr, "  %s: %d, %zu solutions%s (%.1fs, %s)\n", name.c_str(), r.opt, r.hits.size(),
+                     r.plus.empty() ? "" : (", +1: " + std::to_string(r.plus[0].size())).c_str(), secs,
+                     origin[i].c_str());
     }
 }
 
@@ -1209,7 +1288,9 @@ int main(int argc, char** argv) {
         search.goal = goal;
         search.metric = metric;
         for (int k = 1; k <= syms && k < (int)SYMS.size(); ++k) search.symIdx.push_back(k);
-        if (nearDepth > 0) {
+        // The table holds distances to the solved cube, so it only applies
+        // when that is the goal (not for OLL, whose goal is a set of states).
+        if (nearDepth > 0 && goal == Goal::Solved) {
             if (near.depth != nearDepth) near.build(nearDepth, metric);
             search.near = &near;
         }
