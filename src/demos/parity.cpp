@@ -32,6 +32,8 @@ int main() {
     std::swap(bad.s[C3::idx(Face::U,2,1)], bad.s[C3::idx(Face::F,0,1)]);
     std::cout << "=== Solvability ===\n";
     std::cout << "Solved cube solvable:      " << is_solvable(C3::solved()) << "\n";
+    auto legal = C3::solved().apply(mF).apply(mR).apply(mU); // F R U
+    std::cout << "Legal F R U state solvable: " << is_solvable(legal) << "\n";
     std::cout << "Single edge-flip solvable: " << is_solvable(bad) << "\n";
 
     // PLL monoswap: swap exactly two corners (UFL ↔ UFR)

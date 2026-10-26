@@ -28,6 +28,13 @@
 using Perm54 = Permutation<54>;
 using Cube3 = Cube<3>;
 
+// Portable popcount (MSVC has no __builtin_popcount).
+inline int popcount32(unsigned x) {
+    int n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Sticker model: algorithm parsing (full WCA notation incl. wide/slice/rotation)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -329,7 +336,7 @@ struct Pattern {
         unsigned used = 0;
         for (int j = 0; j < k; ++j) {
             int pos = where[tracked[j]];
-            int digit = __builtin_popcount(~used & ((1u << pos) - 1));
+            int digit = popcount32(~used & ((1u << pos) - 1));
             pi = pi * (n - j) + digit;
             used |= 1u << pos;
         }

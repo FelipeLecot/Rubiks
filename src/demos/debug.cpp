@@ -36,9 +36,10 @@ int main() {
     print_order("FD", D.compose(F));
     print_order("LD", D.compose(L));
 
-    // Commutator RUR'U' = 6
+    // Commutators: [R,U] = RUR'U' and [R,U'] = RU'R'U both have order 6.
     auto Ri = R.inverse(); auto Ui = U.inverse();
-    print_order("RUR'U'", Ui.compose(Ri).compose(U).compose(R));
+    print_order("RUR'U'",   compose_moves<3>({R, U, Ri, Ui}));
+    print_order("RU'R'U",   compose_moves<3>({R, Ui, Ri, U}));
 
     // Sanity: scramble + inverse = solved
     auto scr = F.compose(R).compose(U).compose(B).compose(L);

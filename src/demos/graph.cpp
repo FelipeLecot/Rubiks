@@ -76,7 +76,7 @@ int main() {
     std::cout << "=== Cayley graph BFS on 2x2 ===\n";
     std::cout << "Total states reachable: " << dist.size() << "  (expect 3,674,160)\n";
     std::cout << "God's Number (diameter): " << max_dist
-              << "  (with RUF generators; 14 with all 6 faces)\n\n";
+              << "  (with RUF generators; 14 in the quarter-turn metric)\n\n";
 
     // Distribution of states by distance
     std::vector<int> cnt(max_dist + 1, 0);

@@ -92,23 +92,47 @@ int corner_orientation(const Cube<3>& cube, int pos) {
     int c2 = cube.s[CORNERS[pos][2]]; // sticker on L/R face
     bool c0_is_ud = (c0==U || c0==D);
     bool c1_is_ud = (c1==U || c1==D);
-    if (c0_is_ud) return 0;
-    if (c1_is_ud) return 1; // one CW twist: U/D color is on FB face
-    return 2;               // two CW twists: U/D color is on LR face
+    int ori;
+    if (c0_is_ud)      ori = 0;
+    else if (c1_is_ud) ori = 1; // U/D colour is on the F/B face
+    else               ori = 2; // U/D colour is on the L/R face
+
+    // The slots above are listed as [UD, FB, LR].  For four of the eight
+    // corners the physical clockwise order is [UD, LR, FB], so the two
+    // nonzero twists must be swapped there.  (Equivalently: use Kociemba's
+    // facelet order, which is [UD, LR, FB] for URF/ULB/DLF/DRB and
+    // [UD, FB, LR] for the other four.)  Without this the twist sum is not
+    // invariant under F/B/L/R moves.
+    if ((pos == 1 || pos == 2 || pos == 4 || pos == 7) && ori != 0)
+        ori = 3 - ori;
+    return ori;
 }
 
 // Edge orientation at position pos: 0=good, 1=flipped.
-// An edge is good when the sticker on its U/D or F/B face-slot has a color
-// that "matches" that face category:
-//   - slot on U or D face → sticker should be U or D color
-//   - slot on F or B face → sticker should be F or B color
-// This is equivalent to the standard "can be placed without U/D quarter-turns" criterion.
+//
+// Each edge cubie has a reference colour: its U/D colour if it has one, and
+// its F/B colour if it is a middle-slice edge.  Each position has a reference
+// slot, EDGES[pos][0].  The edge is oriented iff its reference colour is in
+// that reference slot.  This is the convention under which U, D, R, L and the
+// half-turns preserve orientation and F/B quarter-turns flip four edges.  A
+// simpler "face type" test fails as soon as the piece permutation is
+// nontrivial.
 int edge_orientation(const Cube<3>& cube, int pos) {
-    int sticker_idx = EDGES[pos][0];
-    int face  = sticker_idx / 9;   // which face the sticker lives on
-    int color = cube.s[sticker_idx];
-    if (face == U || face == D) return (color == U || color == D) ? 0 : 1;
-    else                        return (color == F || color == B) ? 0 : 1;
+    static const int piece_colors[12][2] = {
+        {U,F},{U,R},{U,B},{U,L},{F,R},{F,L},{B,R},{B,L},{D,F},{D,R},{D,B},{D,L}
+    };
+    int s0 = EDGES[pos][0], s1 = EDGES[pos][1];
+    int piece = find_edge(cube.s[s0], cube.s[s1]);
+    if (piece < 0) return 0;
+
+    int a = piece_colors[piece][0], b = piece_colors[piece][1];
+    int ref_color;
+    if (a == U || a == D)      ref_color = a;
+    else if (b == U || b == D) ref_color = b;
+    else if (a == F || a == B) ref_color = a;
+    else                       ref_color = b;
+
+    return (cube.s[s0] == ref_color) ? 0 : 1;
 }
 
 int perm_parity(const std::array<int,8>& p) {

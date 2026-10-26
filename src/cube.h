@@ -19,7 +19,7 @@ struct Cube {
         return c;
     }
 
-    static int idx(int face, int row, int col) {
+    static constexpr int idx(int face, int row, int col) {
         return face * N * N + row * N + col;
     }
 

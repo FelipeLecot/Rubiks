@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 include_directories(src)
 
-foreach(demo embedded parity bigcube graph debug)
+foreach(demo embedded parity bigcube graph debug limited godsnumber centers)
     add_executable(${demo} src/demos/${demo}.cpp)
 endforeach()
 
